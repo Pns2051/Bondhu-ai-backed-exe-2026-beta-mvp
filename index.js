@@ -1,5 +1,5 @@
 /**
- * Bondhu AI — Backend Server (v3.2 FINAL, beta)
+ * Bondhu AI — Backend Server (v3.3 FINAL, beta)
  * Bangladesh's first premier AI chat companion.
  *
  * Stack       : Node.js + Express + PostgreSQL (Neon) — designed for Render.
@@ -11,19 +11,23 @@
  *               limiting (per-IP + per-device) · moderation blocklist ·
  *               admin API (stats/users/credits/ban) · usage_logs observability.
  *
- * Credit policy: 1 credit is charged BEFORE generation. Refunded only when
- * Bondhu AI itself fails to deliver (all tiers down / mid-stream failure /
- * empty reply / persist failure before delivery). Deliberate disconnects
- * mid-generation keep the charge (anti-freeload).
+ * Credit policy: 1 credit charged BEFORE generation; refunded only when
+ * Bondhu AI itself fails to deliver. Deliberate disconnects keep the charge.
  *
- * Required env : DATABASE_URL, plus at least one provider key:
- *                GROQ_API_KEY (recommended first tier)
+ * v3.3 fixes:
+ *  - Provider model defaults updated after retirements (llama-3.1-8b-instant
+ *    and gemini-1.5-flash both returned 404 model_not_found in production).
+ *    Groq → llama-3.3-70b-versatile, Gemini → gemini-2.5-flash.
+ *  - Gemini 2.5 Flash "thinking" disabled (thinkingBudget: 0) for instant
+ *    first tokens.
+ *  - GET / status route + GET /api/chat → 405 wrong-method guard.
+ *
+ * Required env : DATABASE_URL, plus at least one provider key (GROQ_API_KEY
+ *                recommended as tier 1).
  * Optional env : GEMINI_API_KEY, MISTRAL_API_KEY, OPENROUTER_API_KEY,
  *                ADMIN_KEY, CORS_ORIGINS, MODERATION_WORDS, PORT,
  *                GROQ_MODEL, GEMINI_MODEL, MISTRAL_MODEL, OPENROUTER_MODEL
- *
- * v3.2 changelog: heartbeat interval properly scoped in respondSSE (was a
- *                 manual patch note in v3.1); route-level socket-error guard.
+ *                (any *_MODEL env var OVERRIDES the code defaults below.)
  */
 
 require('dotenv').config();
@@ -94,10 +98,15 @@ const WORD_BUFFER_LIMIT = 256;    // flush safeguard for unbroken mega-tokens
 const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 
 const MODELS = {
-  groq:       process.env.GROQ_MODEL       || 'llama-3.1-8b-instant',
-  gemini:     process.env.GEMINI_MODEL     || 'gemini-1.5-flash',
+  // v3.3 FIX — previous defaults were retired by their providers (404
+  // model_not_found in production logs, 2026-09). Verify before changing:
+  // console.groq.com/docs/models, ai.google.dev model list.
+  groq:       process.env.GROQ_MODEL       || 'llama-3.3-70b-versatile',
+  gemini:     process.env.GEMINI_MODEL     || 'gemini-2.5-flash',
   mistral:    process.env.MISTRAL_MODEL    || 'mistral-small-latest',
-  openrouter: process.env.OPENROUTER_MODEL || 'meta-llama/llama-3.1-8b-instruct:free',
+  // OpenRouter free model IDs rotate often — if this ever 404s, pick a current
+  // one from https://openrouter.ai/collections/free-models and set OPENROUTER_MODEL.
+  openrouter: process.env.OPENROUTER_MODEL || 'meta-llama/llama-3.3-70b-instruct:free',
 };
 
 const ADMIN_KEY = process.env.ADMIN_KEY || '';
@@ -358,6 +367,14 @@ async function* streamGemini({ apiKey, model, history, userMessage, signal }) {
     })),
     { role: 'user', parts: [{ text: userMessage }] },
   ];
+
+  const generationConfig = { temperature: 0.7, maxOutputTokens: 1024 };
+  // v3.3 FIX: Gemini 2.5 Flash "thinks" by default — several seconds of silence
+  // before the first token. For a chat companion we want instant replies.
+  if (model.includes('2.5-flash')) {
+    generationConfig.thinkingConfig = { thinkingBudget: 0 };
+  }
+
   const res = await fetch(
     `https://generativelanguage.googleapis.com/v1beta/models/${model}:streamGenerateContent?alt=sse`,
     {
@@ -366,7 +383,7 @@ async function* streamGemini({ apiKey, model, history, userMessage, signal }) {
       body: JSON.stringify({
         system_instruction: { parts: [{ text: SYSTEM_PROMPT }] },
         contents,
-        generationConfig: { temperature: 0.7, maxOutputTokens: 1024 },
+        generationConfig,
       }),
       signal,
     }
@@ -769,7 +786,7 @@ async function respondSSE(res, p, clientAc) {
     }
   };
 
-  let heartbeat = null; // declared OUTSIDE try (v3.2 fix) so finally can always clear it
+  let heartbeat = null; // declared OUTSIDE try so finally can always clear it
   try {
     heartbeat = setInterval(() => {
       if (!clientGone) res.write(': heartbeat\n\n');
@@ -852,6 +869,29 @@ app.get('/health', async (req, res) => {
   } catch {
     res.status(503).json({ status: 'degraded', db: 'unreachable' });
   }
+});
+
+// v3.3 NEW: root status page — visiting the domain in a browser no longer
+// returns a confusing 404.
+app.get('/', (req, res) => {
+  res.json({
+    status: 'online',
+    message: 'Bondhu AI Backend is running!',
+    version: '3.3.0-beta',
+    endpoints: {
+      chat: 'POST /api/chat',
+      health: 'GET /health',
+      credits: 'GET /api/credits?device_id=...',
+      sessions: 'GET /api/sessions?device_id=...',
+      history: 'GET /api/history?device_id=...&session_id=...'
+    }
+  });
+});
+
+// v3.3 NEW: wrong-method guard — a GET to /api/chat explains itself instead of
+// returning a misleading 404 "Route not found".
+app.get('/api/chat', (req, res) => {
+  res.status(405).json({ error: 'Method not allowed — /api/chat accepts POST only.' });
 });
 
 app.get('/api/credits', async (req, res) => {
@@ -1107,7 +1147,7 @@ async function main() {
   if (!ADMIN_KEY) console.warn('[admin] ADMIN_KEY not set — admin API returns 503 (disabled).');
 
   const server = app.listen(PORT, () => {
-    console.log(`Bondhu AI backend v3.2 FINAL (beta) is live on port ${PORT}`);
+    console.log(`Bondhu AI backend v3.3 (beta) is live on port ${PORT}`);
   });
 
   // Async errors must never crash a beta silently or loudly.
