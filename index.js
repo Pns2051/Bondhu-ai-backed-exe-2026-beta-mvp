@@ -1,33 +1,41 @@
 /**
- * Bondhu AI — Backend Server (v3.3 FINAL, beta)
+ * Bondhu AI — Backend Server (v3.4 FINAL, beta)
  * Bangladesh's first premier AI chat companion.
  *
  * Stack       : Node.js + Express + PostgreSQL (Neon) — designed for Render.
- * Features    : SSE word-by-word streaming · quad-tier AI fallback cascade
- *               (Groq → Gemini → Mistral → OpenRouter) · UUID sessions with
- *               auto-titles · multi-turn memory (last 10 messages) · device
- *               users with 50 starter credits · daily top-up-to-10 refill
- *               (Asia/Dhaka, cron + sleeping-server catch-up) · dual rate
- *               limiting (per-IP + per-device) · moderation blocklist ·
- *               admin API (stats/users/credits/ban) · usage_logs observability.
+ * Features    : SSE word-by-word streaming · five-tier AI fallback cascade
+ *               (Groq → Gemini → Mistral → OpenRouter MiniMax → OpenRouter
+ *               Gemma) · UUID sessions with auto-titles · multi-turn memory
+ *               (last 10 messages) · device users with 50 starter credits ·
+ *               daily top-up-to-10 refill (Asia/Dhaka, cron + sleeping-server
+ *               catch-up) · dual rate limiting (per-IP + per-device) ·
+ *               moderation blocklist · admin API (stats/users/credits/ban) ·
+ *               usage_logs observability.
  *
  * Credit policy: 1 credit charged BEFORE generation; refunded only when
  * Bondhu AI itself fails to deliver. Deliberate disconnects keep the charge.
  *
- * v3.3 fixes:
- *  - Provider model defaults updated after retirements (llama-3.1-8b-instant
- *    and gemini-1.5-flash both returned 404 model_not_found in production).
- *    Groq → llama-3.3-70b-versatile, Gemini → gemini-2.5-flash.
- *  - Gemini 2.5 Flash "thinking" disabled (thinkingBudget: 0) for instant
- *    first tokens.
- *  - GET / status route + GET /api/chat → 405 wrong-method guard.
+ * v3.4 changes:
+ *  - NEW Tier 5: second OpenRouter model on the same key (default
+ *    google/gemma-4-31b-it:free). Free-tier caps on OpenRouter are
+ *    per-model → two models double the free last-resort capacity.
+ *  - Tier 4 default updated to minimax/minimax-m3:free (replaces the
+ *    retired llama-3.1 free ID).
+ *  - Groq default updated to openai/gpt-oss-120b (verified via this
+ *    account's own /v1/models response — old unprefixed llama IDs are
+ *    not in the org's catalog).
+ *  - The app now runs correctly with ZERO *_MODEL env vars; every model
+ *    remains env-overridable for zero-code-change swaps.
+ *
+ * v3.3 fixes (kept): gemini-2.5-flash default + thinking disabled; GET /
+ * status route; GET /api/chat → 405 guard.
  *
  * Required env : DATABASE_URL, plus at least one provider key (GROQ_API_KEY
  *                recommended as tier 1).
  * Optional env : GEMINI_API_KEY, MISTRAL_API_KEY, OPENROUTER_API_KEY,
  *                ADMIN_KEY, CORS_ORIGINS, MODERATION_WORDS, PORT,
- *                GROQ_MODEL, GEMINI_MODEL, MISTRAL_MODEL, OPENROUTER_MODEL
- *                (any *_MODEL env var OVERRIDES the code defaults below.)
+ *                GROQ_MODEL, GEMINI_MODEL, MISTRAL_MODEL,
+ *                OPENROUTER_MODEL, OPENROUTER_MODEL_2
  */
 
 require('dotenv').config();
@@ -98,15 +106,13 @@ const WORD_BUFFER_LIMIT = 256;    // flush safeguard for unbroken mega-tokens
 const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 
 const MODELS = {
-  // v3.3 FIX — previous defaults were retired by their providers (404
-  // model_not_found in production logs, 2026-09). Verify before changing:
-  // console.groq.com/docs/models, ai.google.dev model list.
-  groq:       process.env.GROQ_MODEL       || 'llama-3.3-70b-versatile',
-  gemini:     process.env.GEMINI_MODEL     || 'gemini-2.5-flash',
-  mistral:    process.env.MISTRAL_MODEL    || 'mistral-small-latest',
-  // OpenRouter free model IDs rotate often — if this ever 404s, pick a current
-  // one from https://openrouter.ai/collections/free-models and set OPENROUTER_MODEL.
-  openrouter: process.env.OPENROUTER_MODEL || 'meta-llama/llama-3.3-70b-instruct:free',
+  // v3.4 defaults — matched against live catalogs (2026-09). If any ID ever
+  // 404s, override it via the matching env var — never requires a code change.
+  groq:        process.env.GROQ_MODEL        || 'openai/gpt-oss-120b',
+  gemini:      process.env.GEMINI_MODEL      || 'gemini-2.5-flash',
+  mistral:     process.env.MISTRAL_MODEL     || 'mistral-small-latest',
+  openrouter:  process.env.OPENROUTER_MODEL  || 'minimax/minimax-m3:free',
+  openrouter2: process.env.OPENROUTER_MODEL_2 || 'google/gemma-4-31b-it:free',
 };
 
 const ADMIN_KEY = process.env.ADMIN_KEY || '';
@@ -369,8 +375,8 @@ async function* streamGemini({ apiKey, model, history, userMessage, signal }) {
   ];
 
   const generationConfig = { temperature: 0.7, maxOutputTokens: 1024 };
-  // v3.3 FIX: Gemini 2.5 Flash "thinks" by default — several seconds of silence
-  // before the first token. For a chat companion we want instant replies.
+  // Gemini 2.5 Flash "thinks" by default — several seconds of silence before
+  // the first token. For a chat companion we want instant replies.
   if (model.includes('2.5-flash')) {
     generationConfig.thinkingConfig = { thinkingBudget: 0 };
   }
@@ -400,7 +406,7 @@ async function* streamGemini({ apiKey, model, history, userMessage, signal }) {
   }
 }
 
-/* ─────────── Quad-Tier Streaming Cascade (Groq → Gemini → Mistral → OpenRouter) ─────────── */
+/* ────── Five-Tier Streaming Cascade (Groq → Gemini → Mistral → OR-MiniMax → OR-Gemma) ────── */
 
 async function* streamReplyWithFallback(history, userMessage, clientSignal, state) {
   const openAIMessages = [
@@ -436,12 +442,26 @@ async function* streamReplyWithFallback(history, userMessage, clientSignal, stat
       }),
     });
   }
+  // Tier 4 — OpenRouter #1 (MiniMax M3: conversational flow, 1M context).
   if (process.env.OPENROUTER_API_KEY) {
     tiers.push({
       name: 'OpenRouter',
       run: (signal) => streamOpenAICompatible({
         url: 'https://openrouter.ai/api/v1/chat/completions',
         apiKey: process.env.OPENROUTER_API_KEY, model: MODELS.openrouter,
+        messages: openAIMessages, extraHeaders: { 'X-Title': 'Bondhu AI' }, signal,
+      }),
+    });
+  }
+  // v3.4 Tier 5 — OpenRouter #2 (Gemma 4 31B on the SAME key). OpenRouter
+  // free-tier caps are per-model, so a second model doubles the free
+  // last-resort capacity. Both tiers stay dormant until tiers 1–3 fail.
+  if (process.env.OPENROUTER_API_KEY) {
+    tiers.push({
+      name: 'OpenRouter-2',
+      run: (signal) => streamOpenAICompatible({
+        url: 'https://openrouter.ai/api/v1/chat/completions',
+        apiKey: process.env.OPENROUTER_API_KEY, model: MODELS.openrouter2,
         messages: openAIMessages, extraHeaders: { 'X-Title': 'Bondhu AI' }, signal,
       }),
     });
@@ -871,13 +891,12 @@ app.get('/health', async (req, res) => {
   }
 });
 
-// v3.3 NEW: root status page — visiting the domain in a browser no longer
-// returns a confusing 404.
+// Root status page — visiting the domain in a browser no longer returns 404.
 app.get('/', (req, res) => {
   res.json({
     status: 'online',
     message: 'Bondhu AI Backend is running!',
-    version: '3.3.0-beta',
+    version: '3.4.0-beta',
     endpoints: {
       chat: 'POST /api/chat',
       health: 'GET /health',
@@ -888,8 +907,7 @@ app.get('/', (req, res) => {
   });
 });
 
-// v3.3 NEW: wrong-method guard — a GET to /api/chat explains itself instead of
-// returning a misleading 404 "Route not found".
+// Wrong-method guard — a GET to /api/chat explains itself.
 app.get('/api/chat', (req, res) => {
   res.status(405).json({ error: 'Method not allowed — /api/chat accepts POST only.' });
 });
@@ -1147,7 +1165,7 @@ async function main() {
   if (!ADMIN_KEY) console.warn('[admin] ADMIN_KEY not set — admin API returns 503 (disabled).');
 
   const server = app.listen(PORT, () => {
-    console.log(`Bondhu AI backend v3.3 (beta) is live on port ${PORT}`);
+    console.log(`Bondhu AI backend v3.4 (beta) is live on port ${PORT}`);
   });
 
   // Async errors must never crash a beta silently or loudly.
