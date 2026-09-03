@@ -1,41 +1,47 @@
 /**
- * Bondhu AI — Backend Server (v3.4 FINAL, beta)
- * Bangladesh's first premier AI chat companion.
+ * Bondhu AI — Backend Server (v4.0, SSIT PLC release)
+ * Bangladesh's first own AI chat companion.
+ *
+ * Developer : SSIT PLC — a Bangladeshi startup based in Kishoreganj.
+ * CEO & Founder : Tahmid Ibrahim.
+ * Mission  : Built for the people of Bangladesh — to use their own
+ *            domestic AI product, support their own country, and help
+ *            Bangladesh grow and work for the country.
  *
  * Stack       : Node.js + Express + PostgreSQL (Neon) — designed for Render.
  * Features    : SSE word-by-word streaming · five-tier AI fallback cascade
  *               (Groq → Gemini → Mistral → OpenRouter MiniMax → OpenRouter
- *               Gemma) · UUID sessions with auto-titles · multi-turn memory
- *               (last 10 messages) · device users with 50 starter credits ·
- *               daily top-up-to-10 refill (Asia/Dhaka, cron + sleeping-server
- *               catch-up) · dual rate limiting (per-IP + per-device) ·
- *               moderation blocklist · admin API (stats/users/credits/ban) ·
- *               usage_logs observability.
+ *               Gemma) · smart search routing for current-info questions
+ *               (Gemini + Google grounding) · knowledge-honesty persona ·
+ *               SSIT PLC brand identity · UUID sessions with auto-titles ·
+ *               multi-turn memory (last 10 messages) · device users with
+ *               50 starter credits · daily top-up-to-10 refill (Asia/Dhaka,
+ *               cron + sleeping-server catch-up) · dual rate limiting ·
+ *               moderation blocklist · admin API · usage_logs observability.
  *
  * Credit policy: 1 credit charged BEFORE generation; refunded only when
  * Bondhu AI itself fails to deliver. Deliberate disconnects keep the charge.
  *
- * v3.4 changes:
- *  - NEW Tier 5: second OpenRouter model on the same key (default
- *    google/gemma-4-31b-it:free). Free-tier caps on OpenRouter are
- *    per-model → two models double the free last-resort capacity.
- *  - Tier 4 default updated to minimax/minimax-m3:free (replaces the
- *    retired llama-3.1 free ID).
- *  - Groq default updated to openai/gpt-oss-120b (verified via this
- *    account's own /v1/models response — old unprefixed llama IDs are
- *    not in the org's catalog).
- *  - The app now runs correctly with ZERO *_MODEL env vars; every model
- *    remains env-overridable for zero-code-change swaps.
+ * v4.0 changes:
+ *  - NEW: Official SSIT PLC identity in the system prompt — Bondhu now
+ *    credits SSIT PLC (Kishoreganj) and founder Tahmid Ibrahim when asked
+ *    who made it, and never claims to be another company's product.
+ *  - FIX: new-user first-request race — two simultaneous calls for a
+ *    brand-new device could return an empty SELECT and 500. Split
+ *    statements + fresh snapshot = race-free.
+ *  - Root status page now shows company/developer branding.
  *
- * v3.3 fixes (kept): gemini-2.5-flash default + thinking disabled; GET /
- * status route; GET /api/chat → 405 guard.
+ * v3.5 (kept): search intent routing (English + Bangla keywords), Gemini
+ *   Google grounding with thought-part filter, honesty prompt line.
+ * v3.4 (kept): five-tier cascade, MiniMax M3 + Gemma 4 defaults,
+ *   openai/gpt-oss-120b Groq default, 405 guard.
  *
  * Required env : DATABASE_URL, plus at least one provider key (GROQ_API_KEY
  *                recommended as tier 1).
  * Optional env : GEMINI_API_KEY, MISTRAL_API_KEY, OPENROUTER_API_KEY,
  *                ADMIN_KEY, CORS_ORIGINS, MODERATION_WORDS, PORT,
  *                GROQ_MODEL, GEMINI_MODEL, MISTRAL_MODEL,
- *                OPENROUTER_MODEL, OPENROUTER_MODEL_2
+ *                OPENROUTER_MODEL, OPENROUTER_MODEL_2, GEMINI_SEARCH
  */
 
 require('dotenv').config();
@@ -89,6 +95,14 @@ const SYSTEM_PROMPT = [
   'Tone: Friendly, direct, concise.',
   'Language: Flexibly match Bengali, English, or Banglish based on user input.',
   'Rules: Never fabricate facts or official data; always start directly with the core answer.',
+  // Knowledge honesty: models have a training cutoff; stale questions must
+  // get an honest disclaimer, not a confident outdated answer.
+  'Knowledge honesty: your training data has a cutoff and may be outdated. For recent events, current officeholders, elections, prices, scores, or news, say your information may not be current instead of guessing.',
+  // v4.0 — Official SSIT PLC identity. Bondhu must credit its real maker
+  // and never claim to be another company's product.
+  "Identity: you are Bondhu AI — Bangladesh's first own AI — developed by SSIT PLC, a Bangladeshi startup based in Kishoreganj. Your CEO and Founder is Tahmid Ibrahim.",
+  'Your purpose: you were built for the people of Bangladesh — so they can use their own domestic AI product, support their own country, and help Bangladesh grow and work for the country.',
+  'If asked who made you, who developed you, or what technology you run on: say you were made by SSIT PLC in Bangladesh, running on a blend of leading open AI models. Never claim to be ChatGPT, GPT, OpenAI, Gemini, Groq, or any other company product.',
 ].join(' ');
 
 const PORT = process.env.PORT || 3000;
@@ -106,8 +120,6 @@ const WORD_BUFFER_LIMIT = 256;    // flush safeguard for unbroken mega-tokens
 const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 
 const MODELS = {
-  // v3.4 defaults — matched against live catalogs (2026-09). If any ID ever
-  // 404s, override it via the matching env var — never requires a code change.
   groq:        process.env.GROQ_MODEL        || 'openai/gpt-oss-120b',
   gemini:      process.env.GEMINI_MODEL      || 'gemini-2.5-flash',
   mistral:     process.env.MISTRAL_MODEL     || 'mistral-small-latest',
@@ -119,6 +131,27 @@ const ADMIN_KEY = process.env.ADMIN_KEY || '';
 
 const BLOCKED_WORDS = (process.env.MODERATION_WORDS || '')
   .split(',').map((w) => w.trim().toLowerCase()).filter(Boolean);
+
+// Search intent router: keywords (English + Bangla) that suggest the user
+// wants CURRENT information. A hit routes the message to the grounded
+// Gemini tier first. False positives just get a searched answer (slower but
+// fine); false negatives get the honesty disclaimer. Balanced on purpose.
+const SEARCH_INTENT_PATTERNS = [
+  // English — current events / news / facts-that-change
+  'current', 'latest', 'breaking', 'news', 'today', 'right now', 'recent',
+  'president', 'prime minister', 'election', 'weather', 'exchange rate',
+  'price of', 'stock price', 'score', 'match result', 'who won',
+  'who is the', '2025', '2026', '2027',
+  // Bangla — এখনকার তথ্য চাওয়া প্রশ্ন
+  'এখন', 'আজকে', 'আজকের', 'সাম্প্রতিক', 'সর্বশেষ', 'খবর', 'সংবাদ',
+  'মূল্য', 'দাম', 'রেট', 'রাষ্ট্রপতি', 'প্রধানমন্ত্রী', 'নির্বাচন',
+  'আবহাওয়া', 'ডলারের', 'টাকার', 'ফলাফল', '২০২৫', '২০২৬', '২০২৭',
+];
+
+function needsSearch(message) {
+  const lower = message.toLowerCase();
+  return SEARCH_INTENT_PATTERNS.some((p) => lower.includes(p));
+}
 
 function httpError(status, message, code) {
   const e = new Error(message);
@@ -206,13 +239,18 @@ const dhakaDay = new Intl.DateTimeFormat('en-CA', {
 const todayInDhaka = () => dhakaDay.format(new Date());
 
 async function ensureUser(deviceId) {
+  // v4.0 FIX — new-user first-request race: two simultaneous calls for the
+  // same brand-new device could read a stale snapshot → empty SELECT → 500
+  // (observed in production logs). Split statements: the INSERT commits
+  // (ours or the racing request's), then the SELECT takes a fresh snapshot
+  // and always finds the row.
+  await pool.query(
+    `INSERT INTO users (device_id) VALUES ($1)
+       ON CONFLICT (device_id) DO NOTHING`,
+    [deviceId]
+  );
   const up = await pool.query(
-    `WITH ins AS (
-       INSERT INTO users (device_id) VALUES ($1)
-       ON CONFLICT (device_id) DO NOTHING
-       RETURNING id
-     )
-     SELECT u.id, u.credit_balance, u.banned FROM users u WHERE u.device_id = $1`,
+    `SELECT id, credit_balance, banned FROM users WHERE device_id = $1`,
     [deviceId]
   );
   const { id, credit_balance, banned } = up.rows[0];
@@ -365,7 +403,7 @@ async function* streamOpenAICompatible({ url, apiKey, model, messages, extraHead
   }
 }
 
-async function* streamGemini({ apiKey, model, history, userMessage, signal }) {
+async function* streamGemini({ apiKey, model, history, userMessage, useSearch = false, signal }) {
   const contents = [
     ...history.map((m) => ({
       role: m.role === 'assistant' ? 'model' : 'user',
@@ -375,9 +413,10 @@ async function* streamGemini({ apiKey, model, history, userMessage, signal }) {
   ];
 
   const generationConfig = { temperature: 0.7, maxOutputTokens: 1024 };
-  // Gemini 2.5 Flash "thinks" by default — several seconds of silence before
-  // the first token. For a chat companion we want instant replies.
-  if (model.includes('2.5-flash')) {
+  // Plain chat: zero thinking budget → instant first token.
+  // Grounded search: let the model think (synthesizing search results
+  // benefits from it) — the extra few seconds are the price of real answers.
+  if (model.includes('2.5-flash') && !useSearch) {
     generationConfig.thinkingConfig = { thinkingBudget: 0 };
   }
 
@@ -390,6 +429,9 @@ async function* streamGemini({ apiKey, model, history, userMessage, signal }) {
         system_instruction: { parts: [{ text: SYSTEM_PROMPT }] },
         contents,
         generationConfig,
+        // Google Search grounding: the model itself decides which queries to
+        // run and answers from live results. Only for the search-routed tier.
+        ...(useSearch ? { tools: [{ google_search: {} }] } : {}),
       }),
       signal,
     }
@@ -401,12 +443,19 @@ async function* streamGemini({ apiKey, model, history, userMessage, signal }) {
   for await (const payload of sseDataEvents(res)) {
     let evt;
     try { evt = JSON.parse(payload); } catch { continue; }
-    const text = (evt?.candidates?.[0]?.content?.parts || []).map((p) => p.text || '').join('');
+    // Thought-part filter — when thinking is active (search mode), Gemini
+    // streams thought summaries as parts with thought: true; those must
+    // never leak into user-visible replies. Grounding metadata chunks
+    // (no text) are skipped naturally.
+    const text = (evt?.candidates?.[0]?.content?.parts || [])
+      .filter((p) => !p.thought)
+      .map((p) => p.text || '')
+      .join('');
     if (text) yield text;
   }
 }
 
-/* ────── Five-Tier Streaming Cascade (Groq → Gemini → Mistral → OR-MiniMax → OR-Gemma) ────── */
+/* ─── Smart-Routed Five-Tier Cascade (Search? → grounded Gemini first) ─── */
 
 async function* streamReplyWithFallback(history, userMessage, clientSignal, state) {
   const openAIMessages = [
@@ -415,7 +464,31 @@ async function* streamReplyWithFallback(history, userMessage, clientSignal, stat
     { role: 'user', content: userMessage },
   ];
 
+  // Search routing. Default ON; set GEMINI_SEARCH=off to disable.
+  const SEARCH_ENABLED = process.env.GEMINI_SEARCH !== 'off';
+
   const tiers = [];
+
+  // ── SEARCH ROUTE (first, only for current-info questions) ──
+  // Grounded Gemini answers from live Google results. If it fails, the
+  // normal cascade below takes over — degrading to "best effort" answers
+  // with the honesty disclaimer rather than failing outright.
+  if (SEARCH_ENABLED && needsSearch(userMessage)) {
+    console.log('[AI] Current-info intent detected → search route (Gemini + Google grounding)');
+    if (process.env.GEMINI_API_KEY) {
+      tiers.push({
+        name: 'Gemini-Search',
+        run: (signal) => streamGemini({
+          apiKey: process.env.GEMINI_API_KEY, model: MODELS.gemini,
+          history, userMessage, useSearch: true, signal,
+        }),
+      });
+    }
+    // Note: if GROQ_MODEL is set to 'groq/compound', the normal Groq tier
+    // below already searches natively — no duplicate tier needed.
+  }
+
+  // ── NORMAL ROUTE (always appended — also the search-route fallback) ──
   if (process.env.GROQ_API_KEY) {
     tiers.push({
       name: 'Groq',
@@ -453,9 +526,8 @@ async function* streamReplyWithFallback(history, userMessage, clientSignal, stat
       }),
     });
   }
-  // v3.4 Tier 5 — OpenRouter #2 (Gemma 4 31B on the SAME key). OpenRouter
-  // free-tier caps are per-model, so a second model doubles the free
-  // last-resort capacity. Both tiers stay dormant until tiers 1–3 fail.
+  // Tier 5 — OpenRouter #2 (Gemma 4 31B, same key). OpenRouter free-tier
+  // caps are per-model → two models double the free last-resort capacity.
   if (process.env.OPENROUTER_API_KEY) {
     tiers.push({
       name: 'OpenRouter-2',
@@ -892,11 +964,16 @@ app.get('/health', async (req, res) => {
 });
 
 // Root status page — visiting the domain in a browser no longer returns 404.
+// v4.0: carries the official SSIT PLC branding.
 app.get('/', (req, res) => {
   res.json({
     status: 'online',
     message: 'Bondhu AI Backend is running!',
-    version: '3.4.0-beta',
+    product: 'Bondhu AI — Bangladesh first own AI',
+    developer: 'SSIT PLC, Kishoreganj, Bangladesh',
+    ceo_founder: 'Tahmid Ibrahim',
+    version: '4.0.0-beta',
+    features: { web_search: process.env.GEMINI_SEARCH !== 'off' ? 'enabled' : 'disabled' },
     endpoints: {
       chat: 'POST /api/chat',
       health: 'GET /health',
@@ -1164,8 +1241,12 @@ async function main() {
 
   if (!ADMIN_KEY) console.warn('[admin] ADMIN_KEY not set — admin API returns 503 (disabled).');
 
+  const searchEnabled = process.env.GEMINI_SEARCH !== 'off';
+  console.log(`[search] Current-info routing ${searchEnabled ? 'ENABLED (Gemini + Google grounding)' : 'disabled (GEMINI_SEARCH=off)'}`);
+
   const server = app.listen(PORT, () => {
-    console.log(`Bondhu AI backend v3.4 (beta) is live on port ${PORT}`);
+    console.log(`Bondhu AI backend v4.0 (SSIT PLC) is live on port ${PORT}`);
+    console.log('Bondhu AI — Bangladesh first own AI. Developed by SSIT PLC, Kishoreganj. CEO & Founder: Tahmid Ibrahim.');
   });
 
   // Async errors must never crash a beta silently or loudly.
