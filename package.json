@@ -1,7 +1,7 @@
 {
   "name": "bondhu-ai-backend",
-  "version": "3.3.0",
-  "description": "Bondhu AI — Bangladesh's first premier AI chat companion backend (beta)",
+  "version": "4.0.0",
+  "description": "Bondhu AI — Bangladesh's first own AI. Developed by SSIT PLC, Kishoreganj.",
   "main": "index.js",
   "scripts": {
     "start": "node index.js",
@@ -11,7 +11,7 @@
   "engines": {
     "node": ">=18.0.0"
   },
-  "keywords": ["bondhu-ai", "bangladesh", "chatbot", "ai", "sse", "express", "postgresql"],
+  "keywords": ["bondhu-ai", "bangladesh", "ssit-plc", "chatbot", "ai", "sse", "express", "postgresql"],
   "license": "MIT",
   "dependencies": {
     "cors": "^2.8.5",
