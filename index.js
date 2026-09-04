@@ -1,5 +1,5 @@
 /**
- * Bondhu AI — Backend Server (v4.2, SSIT PLC release)
+ * Bondhu AI — Backend Server (FINAL v4.5, SSIT PLC release)
  * Bangladesh's first own AI chat companion.
  *
  * Developer : SSIT PLC — a Bangladeshi startup based in Kishoreganj.
@@ -11,42 +11,38 @@
  * Stack       : Node.js + Express + PostgreSQL (Neon) — designed for Render.
  * Features    : SSE word-by-word streaming · five-tier AI fallback cascade
  *               (Groq → Gemini → Mistral → OpenRouter MiniMax → OpenRouter
- *               Gemma) · smart search routing for current-info questions
- *               (Gemini + Google grounding) · knowledge-honesty persona ·
- *               SSIT PLC brand identity · permissive ADULT persona
- *               (18+): companion roleplay, sexual wellness guidance,
- *               creative imagination, open educational answers · UUID
- *               sessions with auto-titles · multi-turn memory (last 10
- *               messages) · device users with 50 starter credits · daily
- *               top-up-to-10 refill (Asia/Dhaka, cron + sleeping-server
- *               catch-up) · dual rate limiting · admin API · usage_logs.
+ *               Gemma) · smart search routing for current-info AND person
+ *               questions (Gemini + Google grounding) · self-question
+ *               exclusions (instant persona answers) · knowledge-honesty
+ *               persona · SSIT PLC brand identity · permissive ADULT (18+)
+ *               persona: companion roleplay, sexual wellness guidance,
+ *               educational openness, creative imagination · UUID sessions
+ *               with auto-titles · multi-turn memory (last 10 messages) ·
+ *               device users with 50 starter credits · daily top-up-to-10
+ *               refill (Asia/Dhaka, cron + sleeping-server catch-up) · dual
+ *               rate limiting · anti-spam screening · admin API · usage_logs
+ *               with 7-day retention · SELF-HEALING STORAGE: passive caps +
+ *               hourly graduated cleanup (70/85/95% tiers) + instant
+ *               disk-full emergency trigger, single-flight guarded.
  *
  * Credit policy: 1 credit charged BEFORE generation; refunded only when
  * Bondhu AI itself fails to deliver. Deliberate disconnects keep the charge.
  *
- * v4.2 changes:
- *  - Permissive adult persona: companion/romantic roleplay for adults,
- *    open sexual-wellness guidance for consenting adults, vivid creative
- *    fiction, no moralizing/disclaimers/lectures.
- *  - Educational openness: sexual health, reproductive health, and
- *    relationship questions answered openly and educationally — filling
- *    Bangladesh's sex-education gap with factual, shame-free guidance.
- *  - Gemini safetySettings: sexually-explicit category requested at
- *    BLOCK_NONE (may be overridden on some keys); others at
- *    BLOCK_ONLY_HIGH.
- *  - Hard limits kept (minors / non-consent / real identifiable people /
- *    weapons & self-harm / fraud) — these are the floor.
- *
- * v4.0/v3.5/v3.4 (kept): five-tier cascade, search intent routing (EN+BN),
- *   race-free ensureUser, SSIT identity, thought-part filter, 405 guard,
- *   root status page, guarded charge + refundOnce, ghost-session cleanup.
+ * This FINAL build consolidates every audited fix from the full review
+ * history (11+ passes): charge-before-generation, race-free ensureUser,
+ * idempotent persistTurn + dedupe index, watchdog per-tier leashes (25s
+ * normal / 60s search), session retention on persist failure, ghost-session
+ * cleanups, statement_timeout, heartbeat guard, pool 15, single-flight
+ * storage cleanup, legal-CTE deletes, activity-age emergency deletion.
  *
  * Required env : DATABASE_URL, plus at least one provider key (GROQ_API_KEY
  *                recommended as tier 1).
  * Optional env : GEMINI_API_KEY, MISTRAL_API_KEY, OPENROUTER_API_KEY,
  *                ADMIN_KEY, CORS_ORIGINS, MODERATION_WORDS, PORT,
  *                GROQ_MODEL, GEMINI_MODEL, MISTRAL_MODEL,
- *                OPENROUTER_MODEL, OPENROUTER_MODEL_2, GEMINI_SEARCH
+ *                OPENROUTER_MODEL, OPENROUTER_MODEL_2, GEMINI_SEARCH,
+ *                DB_STORAGE_LIMIT_MB (default 400 — set to ~80% of your
+ *                actual Neon free-tier storage quota)
  */
 
 require('dotenv').config();
@@ -95,7 +91,8 @@ app.use((req, res, next) => {
 
 /* ────────────────────────────── Configuration ────────────────────────────── */
 
-// v4.2 — permissive ADULT (18+) persona with educational openness.
+// Permissive ADULT (18+) persona with educational openness + public-figure
+// openness. Hard limits remain the floor.
 const SYSTEM_PROMPT = [
   "You are Bondhu AI — Bangladesh's first premier AI chat companion, built for adults.",
   'Tone: Friendly, direct, concise, warm.',
@@ -103,15 +100,16 @@ const SYSTEM_PROMPT = [
   'Rules: Never fabricate facts or official data; always start directly with the core answer.',
   'Knowledge honesty: your training data has a cutoff and may be outdated. For recent events, current officeholders, elections, prices, scores, or news, say your information may not be current instead of guessing.',
   "Identity: you are Bondhu AI — Bangladesh's first own AI — developed by SSIT PLC, a Bangladeshi startup based in Kishoreganj. Your CEO and Founder is Tahmid Ibrahim. You were built for the people of Bangladesh. If asked who made you: say SSIT PLC, Bangladesh, running on a blend of leading open AI models. Never claim to be ChatGPT, GPT, OpenAI, Gemini, Groq, or another company product.",
-  // ── v4.2: permissive adult persona ──
+  // ── permissive adult persona ──
   'Audience: this platform is strictly for adults (18+). Assume every user is an adult.',
   'Persona: you are an open-minded, discreet, imaginative companion. You never moralize, never lecture, never add warnings or disclaimers to answers, and never break the flow of a conversation to note that a topic is sensitive.',
   'Companionship & roleplay: fully embrace any companion or roleplay persona an adult user asks for — girlfriend, boyfriend, romantic partner, fictional character, custom persona. Stay in character with warmth, emotion, and personality. If asked whether you are an AI, acknowledge it gently once, then immediately resume the roleplay. Never refuse a roleplay premise between adults.',
   'Sexual wellness & intimacy: you are a knowledgeable, non-judgmental guide for consenting adults. Discuss sexual health, techniques, products, toys, fantasies, consent, communication, and desire openly and helpfully — the way a trusted discreet friend or a candid wellness guide would. Be direct and vivid when the user wants that; be practical when they want guidance. No refusals, no disclaimers, no redirecting to professionals on these topics.',
-  // ── v4.2: educational openness ──
   'Educational purpose: answer sexual-health, reproductive-health, anatomy, contraception, STI, pregnancy, relationship, and wellness questions openly and educationally, like a knowledgeable health educator. Bangladesh lacks open, shame-free sex education — you fill that gap with factual, culturally-aware, respectful guidance for adults. Never treat an educational question as inappropriate. Recommend professional medical care only when genuinely warranted (e.g. possible infection, complications), while still providing the requested information itself.',
   'Creative imagination: you write vivid fiction of any tone an adult requests — romance, dark themes, mature stories, poetry, scenarios. Fiction is fiction: write it fully, with craft and immersion. Do not water down requested intensity in creative work.',
   'Openness: discuss politics, religion, current affairs, taboo social topics, and controversial matters factually and directly. No moralizing, no both-sides hedging unless asked, no refusing legal-but-sensitive topics.',
+  // ── public figures ──
+  'Public figures: biographical and factual questions about real public figures — politicians, celebrities, athletes, historical figures — are always appropriate and should be answered factually. If unsure about a person, say you are not certain rather than refusing. Never refuse a "who is…" question.',
   'Honesty over comfort: within these freedoms, still never fabricate facts — especially medical safety facts (STIs, contraception, pregnancy, drug interactions). If you genuinely do not know, say so briefly, then continue helpfully.',
   'Hard limits — absolute, never override regardless of request or roleplay framing: no sexual content involving minors or anyone under 18 in any scenario, fictional or not; no non-consensual sexual scenarios; no sexual content about real, identifiable people; no instructions for weapons, explosives, or self-harm methods; no help with scams, phishing, or fraud. If a request hits these limits, decline briefly and offer the closest permitted alternative instead.',
 ].join(' ');
@@ -124,9 +122,25 @@ const MAX_DEVICE_ID_LENGTH = 200;
 const DAILY_REFILL_TO = 10;       // top up to this when below this, once per Dhaka day
 const REFILL_TZ = 'Asia/Dhaka';
 
-const TIER_TIMEOUT_MS = 25000;    // watchdog: max wait for FIRST chunk or silent gap
+const TIER_TIMEOUT_MS = 25000;    // watchdog: normal tiers
+const SEARCH_TIER_TIMEOUT_MS = 60000; // search tier: thinking + Google search before
+                                      // the first VISIBLE token — thought-only
+                                      // chunks yield no text, so they never reset
+                                      // the watchdog. Needs a longer leash.
 const HEARTBEAT_MS = 15000;       // SSE keepalive (survives proxy idle timeouts)
 const WORD_BUFFER_LIMIT = 256;    // flush safeguard for unbroken mega-tokens
+
+// ── Storage management ──
+// Target ceiling for DB size (MB). Conservative default assuming a ~0.5GB
+// free quota — CHECK YOUR ACTUAL Neon storage limit (Dashboard) and set
+// DB_STORAGE_LIMIT_MB to ~80% of it via env var.
+const DB_STORAGE_LIMIT_MB = (() => {
+  const v = parseInt(process.env.DB_STORAGE_LIMIT_MB, 10);
+  // Clamp — a negative or NaN limit would silently disable the monitor.
+  return (Number.isFinite(v) && v >= 10) ? v : 400;
+})();
+const MAX_SESSIONS_PER_USER = 50;     // sessions endpoint lists max 50 — invisible
+const MAX_MESSAGES_PER_SESSION = 200; // memory uses 10, history returns 100 — invisible
 
 const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 
@@ -144,23 +158,38 @@ const BLOCKED_WORDS = (process.env.MODERATION_WORDS || '')
   .split(',').map((w) => w.trim().toLowerCase()).filter(Boolean);
 
 // Search intent router: keywords (English + Bangla) that suggest the user
-// wants CURRENT information. A hit routes the message to the grounded
-// Gemini tier first. False positives just get a searched answer (slower but
-// fine); false negatives get the honesty disclaimer. Balanced on purpose.
+// wants CURRENT information OR asks about a PERSON. A hit routes the message
+// to the grounded Gemini tier first. False positives just get a searched
+// answer (slower but fine); false negatives get the honesty disclaimer.
 const SEARCH_INTENT_PATTERNS = [
   // English — current events / news / facts-that-change
   'current', 'latest', 'breaking', 'news', 'today', 'right now', 'recent',
   'president', 'prime minister', 'election', 'weather', 'exchange rate',
   'price of', 'stock price', 'score', 'match result', 'who won',
   'who is the', '2025', '2026', '2027',
+  // English — person identification
+  'who is', 'who was', 'who are', 'tell me about',
   // Bangla — এখনকার তথ্য চাওয়া প্রশ্ন
   'এখন', 'আজকে', 'আজকের', 'সাম্প্রতিক', 'সর্বশেষ', 'খবর', 'সংবাদ',
   'মূল্য', 'দাম', 'রেট', 'রাষ্ট্রপতি', 'প্রধানমন্ত্রী', 'নির্বাচন',
   'আবহাওয়া', 'ডলারের', 'টাকার', 'ফলাফল', '২০২৫', '২০২৬', '২০২৭',
+  // Bangla — person identification
+  'কে হলেন', 'কে ছিলেন', 'কে সে', 'সম্পর্কে বলো',
+];
+
+// Self/identity questions must NOT route to search: they're answered from
+// the persona instantly. Without this, "who are you?" (the most common chat
+// opener) paid the search-route latency for zero benefit.
+const SELF_QUESTION_EXCLUSIONS = [
+  'who are you', 'who are u', 'who r u',
+  'who is your', 'who was your', 'who are your',
+  'tell me about yourself', 'tell me about your',
+  'তুমি কে', 'তুমি কার', 'তোমার নাম',
 ];
 
 function needsSearch(message) {
   const lower = message.toLowerCase();
+  if (SELF_QUESTION_EXCLUSIONS.some((p) => lower.includes(p))) return false;
   return SEARCH_INTENT_PATTERNS.some((p) => lower.includes(p));
 }
 
@@ -183,8 +212,12 @@ const isLocalDB = process.env.DATABASE_URL.includes('localhost');
 const pool = new Pool({
   connectionString: process.env.DATABASE_URL,
   ssl: isLocalDB ? false : { rejectUnauthorized: false }, // Neon requires SSL
-  max: 10,
+  max: 15,
   idleTimeoutMillis: 30000,
+  // Kill any query stuck >8s — a hung statement can otherwise hold a pool
+  // client hostage and stall other users. All our queries run <1s, so 8s is
+  // a generous ceiling. Server-enforced (sent as a connection parameter).
+  statement_timeout: 8000,
 });
 
 // Without this listener an idle-client error (Neon drops idle connections
@@ -239,6 +272,13 @@ async function initSchema() {
     CREATE INDEX IF NOT EXISTS idx_sessions_user    ON sessions (user_id);
     CREATE INDEX IF NOT EXISTS idx_usage_created    ON usage_logs (created_at);
     CREATE INDEX IF NOT EXISTS idx_usage_user       ON usage_logs (user_id);
+
+    -- Duplicate-message guard (retry-safe persist). Identical
+    -- (session, role, content, timestamp) can only exist once. Legitimate
+    -- same-second distinct messages are safe: one transaction = one timestamp,
+    -- and the two roles differ.
+    CREATE UNIQUE INDEX IF NOT EXISTS idx_messages_dedupe
+      ON messages (session_id, role, content, created_at);
   `);
 }
 
@@ -250,11 +290,9 @@ const dhakaDay = new Intl.DateTimeFormat('en-CA', {
 const todayInDhaka = () => dhakaDay.format(new Date());
 
 async function ensureUser(deviceId) {
-  // v4.0 FIX — new-user first-request race: two simultaneous calls for the
-  // same brand-new device could read a stale snapshot → empty SELECT → 500
-  // (observed in production logs). Split statements: the INSERT commits
-  // (ours or the racing request's), then the SELECT takes a fresh snapshot
-  // and always finds the row.
+  // Race-free get-or-create: split statements. The INSERT commits (ours or
+  // a racing request's — ON CONFLICT DO NOTHING blocks until the winner
+  // commits), then the SELECT takes a fresh snapshot and always finds the row.
   await pool.query(
     `INSERT INTO users (device_id) VALUES ($1)
        ON CONFLICT (device_id) DO NOTHING`,
@@ -287,6 +325,8 @@ async function ensureUser(deviceId) {
 function scheduleMidnightRefill() {
   cron.schedule('0 0 * * *', async () => {
     try {
+      const sizeMB = await getDatabaseSizeMB().catch(() => null);
+      if (sizeMB != null) console.log(`[storage] daily size: ${Math.round(sizeMB)}MB / ${DB_STORAGE_LIMIT_MB}MB`);
       const { rowCount } = await pool.query(
         `UPDATE users
             SET credit_balance = $2, last_refill_date = $1::date
@@ -301,10 +341,153 @@ function scheduleMidnightRefill() {
   }, { timezone: REFILL_TZ });
 }
 
+// usage_logs grows forever otherwise — table bloat, slow stats. Keep 7 days;
+// delete older. Runs 00:10 Dhaka (after the refill cron).
+function scheduleLogCleanup() {
+  cron.schedule('10 0 * * *', async () => {
+    try {
+      const { rowCount } = await pool.query(
+        `DELETE FROM usage_logs WHERE created_at < NOW() - INTERVAL '7 days'`
+      );
+      if (rowCount > 0) console.log(`[cleanup] usage_logs: removed ${rowCount} rows older than 7 days.`);
+    } catch (err) {
+      console.error('[cleanup] failed:', err.message);
+    }
+  }, { timezone: REFILL_TZ });
+}
+
+/* ───────────────── Storage Management (auto-cleanup, self-healing) ───────────────── */
+
+// Fires whenever a new session is created: keeps every user at ≤ 50 sessions.
+// CTE form — the plain-subquery form (DELETE ... WHERE id IN (SELECT ... FROM
+// sessions)) is illegal in PostgreSQL (cannot reference the delete-target
+// table in a subquery).
+async function enforceSessionCap(userId) {
+  await pool.query(
+    `WITH old_sessions AS (
+       SELECT id FROM sessions WHERE user_id = $1
+         ORDER BY created_at DESC OFFSET $2
+     )
+     DELETE FROM sessions WHERE id IN (SELECT id FROM old_sessions)`,
+    [userId, MAX_SESSIONS_PER_USER]
+  );
+}
+
+async function getDatabaseSizeMB() {
+  const r = await pool.query(`SELECT pg_database_size(current_database()) AS bytes`);
+  return Number(r.rows[0].bytes) / (1024 * 1024);
+}
+
+// Postgres SQLSTATE 53100 = disk_full; string match as belt-and-braces.
+function isDiskFullError(err) {
+  if (!err) return false;
+  const hay = [err.code, err.message, err.detail, err.hint].filter(Boolean).join(' ');
+  return err.code === '53100' || /disk full|no space left|out of storage/i.test(hay);
+}
+
+let cleanupInProgress = false; // single-flight — disk-full storms can trigger
+                               // N concurrent cleanups; one at a time.
+
+async function runStorageCleanup() {
+  const sizeMB = await getDatabaseSizeMB();
+  const pct = sizeMB / DB_STORAGE_LIMIT_MB;
+  if (pct < 0.70) return;
+
+  console.warn(`[storage] DB at ${Math.round(sizeMB)}MB of ${DB_STORAGE_LIMIT_MB}MB (${Math.round(pct * 100)}%) — graduated cleanup starting`);
+
+  // Tier 1 (≥70%): logs down to 1 day
+  await pool.query(`DELETE FROM usage_logs WHERE created_at < NOW() - INTERVAL '1 day'`);
+
+  // Tier 2 (≥85%): 10 sessions per user + 200 messages per session
+  // CTE forms — same legality requirement as enforceSessionCap.
+  if (pct >= 0.85) {
+    await pool.query(
+      `WITH ranked AS (
+         SELECT id, ROW_NUMBER() OVER (PARTITION BY user_id ORDER BY created_at DESC) AS rn
+           FROM sessions
+       )
+       DELETE FROM sessions WHERE id IN (SELECT id FROM ranked WHERE rn > 10)`
+    );
+    await pool.query(
+      `WITH ranked AS (
+         SELECT id, ROW_NUMBER() OVER (PARTITION BY session_id ORDER BY id DESC) AS rn
+           FROM messages
+       )
+       DELETE FROM messages WHERE id IN (SELECT id FROM ranked WHERE rn > $1)`,
+      [MAX_MESSAGES_PER_SESSION]
+    );
+  }
+
+  // Tier 3 (≥95%): the emergency option
+  // DELETE instead of TRUNCATE — TRUNCATE needs an exclusive lock and would
+  // hang/crash against concurrent usage INSERTs under our 8s
+  // statement_timeout. DELETE works under row locks.
+  // Session age = LAST ACTIVITY, not creation — a session created 31 days
+  // ago but chatted in yesterday is LIVE and must survive. Inactive 30+
+  // days with zero messages in that window = genuinely dead.
+  if (pct >= 0.95) {
+    await pool.query(`DELETE FROM usage_logs`);
+    await pool.query(
+      `WITH old AS (
+         SELECT s.id FROM sessions s
+         WHERE s.created_at < NOW() - INTERVAL '30 days'
+           AND NOT EXISTS (
+             SELECT 1 FROM messages m
+              WHERE m.session_id = s.id
+                AND m.created_at > NOW() - INTERVAL '30 days'
+           )
+       )
+       DELETE FROM sessions WHERE id IN (SELECT id FROM old)`
+    );
+    console.error('[storage] EMERGENCY tier executed — usage_logs cleared, sessions inactive for 30+ days deleted');
+  }
+
+  // VACUUM with the statement timeout DISABLED locally: on large tables
+  // VACUUM exceeds 8s and would be killed at exactly the moment it matters.
+  // A dedicated client, timeout lifted, released immediately — the rest of
+  // the pool keeps the normal 8s ceiling.
+  try {
+    const vac = await pool.connect();
+    try {
+      await vac.query('SET statement_timeout = 0');
+      await vac.query('VACUUM ANALYZE messages');
+      await vac.query('VACUUM ANALYZE sessions');
+      await vac.query('VACUUM ANALYZE usage_logs');
+    } finally {
+      // RESET restores defaults so the pooled connection returns clean.
+      await vac.query('RESET statement_timeout').catch(() => {});
+      vac.release();
+    }
+  } catch (e) { console.error('[storage] vacuum failed (non-fatal):', e.message); }
+
+  const afterMB = await getDatabaseSizeMB().catch(() => null);
+  console.warn(`[storage] cleanup done — ${Math.round(sizeMB)}MB → ${afterMB != null ? Math.round(afterMB) + 'MB' : 'recheck failed'} (space is reusable even if reported size shrinks slowly)`);
+}
+
+async function runStorageCleanupOnce() {
+  if (cleanupInProgress) {
+    console.warn('[storage] cleanup already running — trigger skipped');
+    return;
+  }
+  cleanupInProgress = true;
+  try { await runStorageCleanup(); }
+  finally { cleanupInProgress = false; }
+}
+
+function scheduleStorageMonitor() {
+  cron.schedule('0 * * * *', async () => {   // hourly
+    try {
+      await runStorageCleanupOnce();
+    } catch (err) {
+      console.error('[storage] monitor failed:', err.message);
+    }
+  });
+}
+
 /* ─────────────────────────── Input screening (anti-spam only) ─────────────────────────── */
 
-// v4.2: content moderation disabled by default (empty MODERATION_WORDS) —
-// only link-spam flooding is blocked, to protect rate limits.
+// Content moderation disabled by default (empty MODERATION_WORDS) — only
+// link-spam flooding is blocked, to protect rate limits.
 function screenMessage(text) {
   const lower = text.toLowerCase();
   for (const w of BLOCKED_WORDS) {
@@ -428,16 +611,16 @@ async function* streamGemini({ apiKey, model, history, userMessage, useSearch = 
   const generationConfig = { temperature: 0.7, maxOutputTokens: 1024 };
   // Plain chat: zero thinking budget → instant first token.
   // Grounded search: let the model think (synthesizing search results
-  // benefits from it) — the extra few seconds are the price of real answers.
+  // benefits from it) — the extra seconds are the price of real answers.
   if (model.includes('2.5-flash') && !useSearch) {
     generationConfig.thinkingConfig = { thinkingBudget: 0 };
   }
 
-  // v4.2 — permissive adult configuration: harassment/hate/dangerous stay at
+  // Permissive adult configuration: harassment/hate/dangerous stay at
   // BLOCK_ONLY_HIGH (the practical maximum — BLOCK_NONE is restricted for
   // most API keys and gets overridden), while the category that matters for
-  // adult roleplay/intimacy/education is requested at BLOCK_NONE. If the key
-  // overrides it, behavior falls back to BLOCK_ONLY_HIGH — legit adult
+  // adult roleplay/intimacy/education is requested at BLOCK_NONE. If the
+  // key overrides it, behavior falls back to BLOCK_ONLY_HIGH — legit adult
   // discussion still passes; only extreme explicitness may be filtered.
   const safetySettings = [
     { category: 'HARM_CATEGORY_HARASSMENT', threshold: 'BLOCK_ONLY_HIGH' },
@@ -496,12 +679,12 @@ async function* streamReplyWithFallback(history, userMessage, clientSignal, stat
 
   const tiers = [];
 
-  // ── SEARCH ROUTE (first, only for current-info questions) ──
+  // ── SEARCH ROUTE (first, only for current-info / person questions) ──
   // Grounded Gemini answers from live Google results. If it fails, the
   // normal cascade below takes over — degrading to "best effort" answers
   // with the honesty disclaimer rather than failing outright.
   if (SEARCH_ENABLED && needsSearch(userMessage)) {
-    console.log('[AI] Current-info intent detected → search route (Gemini + Google grounding)');
+    console.log('[AI] Current-info or person intent detected → search route (Gemini + Google grounding)');
     if (process.env.GEMINI_API_KEY) {
       tiers.push({
         name: 'Gemini-Search',
@@ -576,13 +759,18 @@ async function* streamReplyWithFallback(history, userMessage, clientSignal, stat
     const onClientAbort = () => ac.abort(new Error('client disconnected'));
     clientSignal.addEventListener('abort', onClientAbort, { once: true });
 
+    // Per-tier timeout: the search tier gets 60s (thinking + Google search
+    // before the first visible token; thought-only chunks yield no text so
+    // they don't reset the watchdog).
+    const tierTimeout = tier.name === 'Gemini-Search' ? SEARCH_TIER_TIMEOUT_MS : TIER_TIMEOUT_MS;
+
     let watchdog = setTimeout(
-      () => ac.abort(new Error('watchdog: no data for ' + TIER_TIMEOUT_MS + 'ms')),
-      TIER_TIMEOUT_MS
+      () => ac.abort(new Error('watchdog: no data for ' + tierTimeout + 'ms')),
+      tierTimeout
     );
     const resetWatchdog = () => {
       clearTimeout(watchdog);
-      watchdog = setTimeout(() => ac.abort(new Error('watchdog: stream stalled')), TIER_TIMEOUT_MS);
+      watchdog = setTimeout(() => ac.abort(new Error('watchdog: stream stalled')), tierTimeout);
     };
 
     const tierStart = Date.now();
@@ -721,7 +909,7 @@ async function prepareChatRequest(body) {
     throw httpError(400, `Message too long (max ${MAX_MESSAGE_LENGTH} characters).`);
   }
 
-  // v4.2: anti-spam screen only — content moderation disabled by default
+  // Anti-spam screen only — content moderation disabled by default
   // (MODERATION_WORDS is empty unless set). Blocks only 6+ link floods.
   const screen = screenMessage(userMessage);
   if (screen.blocked) {
@@ -752,6 +940,8 @@ async function prepareChatRequest(body) {
       [user.id]
     );
     sessionId = created.rows[0].id;
+    // Bounded per-user growth — invisible to users (sessions list caps at 50).
+    enforceSessionCap(user.id).catch(() => {});
   }
 
   // Multi-turn memory: last 10 messages, chronological order.
@@ -775,6 +965,13 @@ async function prepareChatRequest(body) {
   );
   if (charge.rowCount === 0) {
     // Drained by a concurrent request between the check above and here.
+    // Clean the ghost session created moments ago (no-op for older,
+    // populated sessions — the NOT EXISTS guard handles them).
+    await pool.query(
+      `DELETE FROM sessions WHERE id = $1
+         AND NOT EXISTS (SELECT 1 FROM messages WHERE session_id = $1)`,
+      [sessionId]
+    ).catch(() => {});
     throw httpError(402, 'আপনার ফ্রি ক্রেডিট শেষ হয়ে গেছে। (Out of credits.)');
   }
 
@@ -792,16 +989,22 @@ async function prepareChatRequest(body) {
 }
 
 // Persist only — the credit was already charged in prepareChatRequest.
+// Retry-safe: ON CONFLICT DO NOTHING + the unique dedupe index make any
+// double-committed insert a silent no-op instead of duplicate rows.
 async function persistTurn(sessionId, userMessage, assistantReply) {
   const client = await pool.connect();
   try {
     await client.query('BEGIN');
     await client.query(
-      'INSERT INTO messages (session_id, role, content) VALUES ($1, $2, $3)',
+      `INSERT INTO messages (session_id, role, content)
+       VALUES ($1, $2, $3)
+       ON CONFLICT DO NOTHING`,
       [sessionId, 'user', userMessage]
     );
     await client.query(
-      'INSERT INTO messages (session_id, role, content) VALUES ($1, $2, $3)',
+      `INSERT INTO messages (session_id, role, content)
+       VALUES ($1, $2, $3)
+       ON CONFLICT DO NOTHING`,
       [sessionId, 'assistant', assistantReply]
     );
     // Auto-title: first user message, capped at 60 chars (codepoint-safe slice).
@@ -908,7 +1111,8 @@ async function respondSSE(res, p, clientAc) {
   let heartbeat = null; // declared OUTSIDE try so finally can always clear it
   try {
     heartbeat = setInterval(() => {
-      if (!clientGone) res.write(': heartbeat\n\n');
+      if (clientGone) return;
+      try { res.write(': heartbeat\n\n'); } catch { /* socket dying — ignore */ }
     }, HEARTBEAT_MS);
 
     send('meta', {
@@ -952,7 +1156,10 @@ async function respondSSE(res, p, clientAc) {
       console.error('[chat:sse] persist:', err.message);
       // Reply was already delivered — don't send a scary 'error' after it.
       // Client keeps the text; it just wasn't saved (persisted: false).
-      cleanupEmptySession(p.sessionId);
+      // The session is RETAINED — the client still holds this session_id in
+      // the done event; deleting it would guarantee a silent memory reset
+      // next turn. The empty session may recover on the next successful
+      // turn; a rare ghost row is the better trade.
       send('done', { reply, session_id: p.sessionId, remaining_credits: p.balance, persisted: false });
       return;
     }
@@ -990,7 +1197,7 @@ app.get('/health', async (req, res) => {
   }
 });
 
-// Root status page — official SSIT PLC branding.
+// Root status page — official SSIT PLC branding + 18+ audience indicator.
 app.get('/', (req, res) => {
   res.json({
     status: 'online',
@@ -998,9 +1205,12 @@ app.get('/', (req, res) => {
     product: 'Bondhu AI — Bangladesh first own AI',
     developer: 'SSIT PLC, Kishoreganj, Bangladesh',
     ceo_founder: 'Tahmid Ibrahim',
-    version: '4.2.0-beta',
+    version: '4.5.0-final',
     audience: '18+',
-    features: { web_search: process.env.GEMINI_SEARCH !== 'off' ? 'enabled' : 'disabled' },
+    features: {
+      web_search: process.env.GEMINI_SEARCH !== 'off' ? 'enabled' : 'disabled',
+      storage_autocleanup: 'enabled (70/85/95% graduated tiers)',
+    },
     endpoints: {
       chat: 'POST /api/chat',
       health: 'GET /health',
@@ -1039,7 +1249,7 @@ app.get('/api/history', async (req, res) => {
   try {
     const sessionId = (req.query.session_id || '').toString();
     const deviceId = (req.query.device_id || '').toString().trim();
-    if (!UUID_RE.test(sessionId) || !deviceId) {
+    if (!UUID_RE.test(sessionId) || !deviceId || deviceId.length > MAX_DEVICE_ID_LENGTH) {
       return res.status(400).json({ error: 'session_id and device_id are required.' });
     }
     const owned = await pool.query(
@@ -1085,7 +1295,7 @@ app.delete('/api/sessions/:id', async (req, res) => {
   try {
     const sessionId = (req.params.id || '').toString();
     const deviceId = (req.query.device_id || '').toString().trim();
-    if (!UUID_RE.test(sessionId) || !deviceId) {
+    if (!UUID_RE.test(sessionId) || !deviceId || deviceId.length > MAX_DEVICE_ID_LENGTH) {
       return res.status(400).json({ error: 'A valid session_id and device_id are required.' });
     }
     const r = await pool.query(
@@ -1115,6 +1325,12 @@ app.post('/api/chat', chatLimiter, async (req, res) => {
   try {
     p = await prepareChatRequest(req.body);
   } catch (err) {
+    // A full disk fires the emergency cleanup IMMEDIATELY — the hourly
+    // monitor could otherwise leave users locked out for up to 59 minutes.
+    if (isDiskFullError(err)) {
+      runStorageCleanupOnce().catch(() => {});
+      return res.status(503).json({ error: 'Bondhu AI storage cleanup running — এক মিনিট পরে আবার চেষ্টা করুন। (Try again in a minute.)' });
+    }
     // Only our own httpError messages are safe to show clients — raw errors
     // (DB internals, provider details) must never leak.
     const safeMessage = err.status ? err.message : 'Internal server error. একটু পরে আবার চেষ্টা করুন।';
@@ -1261,18 +1477,37 @@ app.use((err, req, res, next) => {
 
 async function main() {
   await initSchema();
-  console.log('[DB] Schema ready: users, sessions, messages, usage_logs');
+  console.log('[DB] Schema ready: users, sessions, messages, usage_logs (dedupe index, 7-day log retention)');
 
   scheduleMidnightRefill();
   console.log(`[refill] Daily top-up armed for 00:00 ${REFILL_TZ} (to ${DAILY_REFILL_TO}, when below ${DAILY_REFILL_TO})`);
 
+  scheduleLogCleanup();
+  console.log('[cleanup] usage_logs retention: 7 days (nightly 00:10 Dhaka)');
+
+  scheduleStorageMonitor();
+  console.log(`[storage] monitor armed — hourly check, ${DB_STORAGE_LIMIT_MB}MB limit (set DB_STORAGE_LIMIT_MB to match your Neon quota)`);
+
+  // Boot-time check, retry-once: Neon cold-start can make the first size
+  // query slow; a failure here must never break boot (Render would restart-loop).
+  const bootCheck = async (attempt) => {
+    try { await runStorageCleanupOnce(); }
+    catch (e) {
+      if (attempt === 1) {
+        console.warn('[storage] boot check failed, retrying once…');
+        setTimeout(() => bootCheck(2), 3000);
+      } else { console.error('[storage] boot check failed twice — hourly monitor will take over.'); }
+    }
+  };
+  bootCheck(1);
+
   if (!ADMIN_KEY) console.warn('[admin] ADMIN_KEY not set — admin API returns 503 (disabled).');
 
   const searchEnabled = process.env.GEMINI_SEARCH !== 'off';
-  console.log(`[search] Current-info routing ${searchEnabled ? 'ENABLED (Gemini + Google grounding)' : 'disabled (GEMINI_SEARCH=off)'}`);
+  console.log(`[search] Current-info + person routing ${searchEnabled ? 'ENABLED (Gemini + Google grounding)' : 'disabled (GEMINI_SEARCH=off)'}`);
 
   const server = app.listen(PORT, () => {
-    console.log(`Bondhu AI backend v4.2 (SSIT PLC) is live on port ${PORT}`);
+    console.log(`Bondhu AI backend v4.5 FINAL (SSIT PLC) is live on port ${PORT}`);
     console.log('Bondhu AI — Bangladesh first own AI. Developed by SSIT PLC, Kishoreganj. CEO & Founder: Tahmid Ibrahim.');
   });
 
